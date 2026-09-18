@@ -12,6 +12,9 @@
 backtrader==1.9.76.123
 matplotlib==3.8.4
 numpy==1.26.4
+pandas>=1.5.0
+# MT5 实盘（仅 Windows 支持，Linux/Mac 可不装，使用 --dry-run 模拟）
+# MetaTrader5>=5.0.45; sys_platform == "win32"
 Pillow==10.3.0
 cycler==0.12.1
 fonttools==4.51.0
