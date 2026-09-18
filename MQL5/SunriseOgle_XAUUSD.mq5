@@ -188,7 +188,7 @@ double CalcLots(double entry, double sl)
    double riskAmt = balance * InpRiskPercent;
    double dist = MathAbs(entry - sl);
    if(dist <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double contract = SymbolInfoDouble(_Symbol, SYMBOL_CONTRACT_SIZE);
+   double contract = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
    if(contract <= 0) contract = 100;
    double lots = riskAmt / (dist * contract);
    double volMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -456,7 +456,11 @@ void OnTick()
             ok = trade.Sell(lots, _Symbol, price, sl, tp, "Sunrise SHORT");
 
          if(ok) Print("✅ 下单成功 ", action, " ", lots, " lots");
-         else   Print("❌ 下单失败 ", GetLastError(), " ", ErrorDescription(GetLastError()));
+         else
+           {
+            int err = GetLastError();
+            Print("❌ 下单失败 err=", err, " retcode=", trade.ResultRetcode(), " msg=", trade.ResultRetcodeDescription());
+           }
 
          ResetState();
          g_signalDetectionATR=0; g_signalDetectionBar=0;
