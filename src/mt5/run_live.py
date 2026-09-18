@@ -35,12 +35,12 @@ from pathlib import Path
 
 # 兼容直接运行与模块运行
 try:
-    from src.mt5.mt5_client import MT5Client
+    from src.mt5.mt5_client import MT5Client, find_mt5_terminals
     from src.mt5.live_strategy import LiveSunriseConfig, LiveSunriseStrategy
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-    from src.mt5.mt5_client import MT5Client
+    from src.mt5.mt5_client import MT5Client, find_mt5_terminals
     from src.mt5.live_strategy import LiveSunriseConfig, LiveSunriseStrategy
 
 logger = logging.getLogger("RunLive")
@@ -64,23 +64,28 @@ DEFAULT_USE_TIME_FILTER = False
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Sunrise Ogle MT5 实盘运行器")
+    p = argparse.ArgumentParser(description="Sunrise Ogle MT5 实盘运行器（支持 --auto 全自动识别）")
     p.add_argument("--dry-run", action="store_true", help="模拟模式（无需MT5终端，使用本地CSV）")
     p.add_argument("--live", action="store_true", help="实盘模式（需Windows MT5终端）")
-    p.add_argument("--symbol", type=str, default=DEFAULT_SYMBOL, help="品种名，如 XAUUSD / GOLD")
+    p.add_argument("--auto", action="store_true", help="全自动模式：自动识别 MT5 路径/黄金品种/已登录账号（无需 --login/--path/--symbol）")
+    p.add_argument("--symbol", type=str, default=DEFAULT_SYMBOL, help="品种名，如 XAUUSD / GOLD（--auto 时自动探测，失败则回退到此值）")
     p.add_argument("--timeframe", type=int, default=DEFAULT_TIMEFRAME, help="周期分钟数，默认5")
     p.add_argument("--magic", type=int, default=DEFAULT_MAGIC, help="Magic Number，用于标识本策略订单")
     p.add_argument("--risk", type=float, default=DEFAULT_RISK_PERCENT, help="每笔风险百分比，默认0.01")
     p.add_argument("--poll", type=int, default=DEFAULT_POLL_SECONDS, help="轮询间隔秒数，默认10")
-    p.add_argument("--login", type=int, default=None, help="MT5 账号")
+    p.add_argument("--login", type=int, default=None, help="MT5 账号（--auto 时可省略，自动复用终端已登录账号）")
     p.add_argument("--password", type=str, default=None, help="MT5 密码")
     p.add_argument("--server", type=str, default=None, help="MT5 服务器，如 MetaQuotes-Demo")
-    p.add_argument("--path", type=str, default=None, help="MT5 terminal64.exe 完整路径")
+    p.add_argument("--path", type=str, default=None, help="MT5 terminal64.exe 完整路径（--auto 时自动扫描）")
     p.add_argument("--enable-short", action="store_true", help="启用 SHORT（默认仅LONG）")
     p.add_argument("--enable-long", action="store_true", help="显式启用 LONG（默认已启用）")
     p.add_argument("--disable-long", action="store_true", help="禁用 LONG，仅做SHORT")
     p.add_argument("--max-daily-loss", type=float, default=DEFAULT_MAX_DAILY_LOSS_PERCENT, help="日内最大亏损百分比，默认0.05")
     p.add_argument("--once", action="store_true", help="仅执行一次判断后退出（用于测试）")
+    p.add_argument("--no-auto-symbol", action="store_true", help="禁用自动品种识别（强制使用 --symbol）")
+    p.add_argument("--no-auto-path", action="store_true", help="禁用自动路径识别（强制使用 --path）")
+    p.add_argument("--list-terminals", action="store_true", help="列出本机所有 MT5 终端路径后退出（调试用）")
+    p.add_argument("--list-symbols", action="store_true", help="连接后列出所有黄金相关品种后退出（调试用）")
     return p.parse_args()
 
 
@@ -94,14 +99,37 @@ def run():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # 特殊调试指令：列出终端路径（无需连接）
+    if args.list_terminals:
+        terminals = find_mt5_terminals()
+        if not terminals:
+            print("未发现任何 MT5 终端。请检查是否已安装 MT5，或用 --path 手动指定")
+            print("提示：可设置环境变量 MT5_PATH 指向 terminal64.exe")
+        else:
+            print(f"发现 {len(terminals)} 个 MT5 终端：")
+            for idx, t in enumerate(terminals, 1):
+                print(f"  [{idx}] {t}")
+            print("\n可直接运行： python src/mt5/run_live.py --auto  （自动选用第1个）")
+            print(f"或指定： python src/mt5/run_live.py --live --path \"{terminals[0]}\"")
+        return 0
+
     # 决定运行模式
     if args.live and args.dry_run:
         raise SystemExit("不能同时指定 --live 和 --dry-run")
 
     if not args.live and not args.dry_run:
         # 默认 dry-run，方便新手一键验证
-        logger.warning("未指定 --live 或 --dry-run，默认进入 --dry-run 模拟模式（安全）")
-        args.dry_run = True
+        # 若用户指定了 --auto 但未指定 --live，也视为请求 live 自动模式
+        if args.auto:
+            args.live = True
+            logger.info("--auto 已启用，自动进入 LIVE 模式（尝试复用已登录终端）")
+        else:
+            logger.warning("未指定 --live 或 --dry-run，默认进入 --dry-run 模拟模式（安全）")
+            args.dry_run = True
+
+    # --auto 隐含 --live
+    if args.auto and args.dry_run:
+        logger.warning("--auto 与 --dry-run 同时指定，--auto 在 dry-run 下仅演示自动识别逻辑，不会真实连接")
 
     dry_run = args.dry_run
 
@@ -131,12 +159,17 @@ def run():
     config.verbose_debug = False
 
     logger.info("="*70)
-    logger.info(f"Sunrise Ogle MT5 {'模拟' if dry_run else '实盘'} 启动")
-    logger.info(f"品种: {args.symbol} | 周期: M{args.timeframe} | Magic: {args.magic} | 风险: {config.risk_percent*100:.1f}%")
+    logger.info(f"Sunrise Ogle MT5 {'模拟' if dry_run else '实盘'} 启动{' [AUTO]' if args.auto else ''}")
+    logger.info(f"品种: {args.symbol} {'(自动探测)' if args.auto and not args.no_auto_symbol else ''} | 周期: M{args.timeframe} | Magic: {args.magic} | 风险: {config.risk_percent*100:.1f}%")
     logger.info(f"方向: LONG={config.enable_long_trades} SHORT={config.enable_short_trades}")
     logger.info(f"模式: {'DRY_RUN (CSV模拟)' if dry_run else 'LIVE (连接MT5终端)'}")
+    if args.auto:
+        logger.info(f"自动识别: 路径={'开启' if not args.no_auto_path else '关闭'} | 品种={'开启' if not args.no_auto_symbol else '关闭'} | 账号={'复用已登录' if not args.login else '指定账号'}")
     if not dry_run:
-        logger.info(f"账户: {args.login} @ {args.server} | 终端路径: {args.path or '默认'}")
+        if args.auto and not args.login:
+            logger.info(f"账户: 自动复用终端已登录账号 | 终端路径: {args.path or '自动扫描'}")
+        else:
+            logger.info(f"账户: {args.login} @ {args.server} | 终端路径: {args.path or ('自动扫描' if not args.no_auto_path else '默认')}")
     logger.info("="*70)
 
     # 初始化 MT5 客户端
@@ -147,10 +180,43 @@ def run():
         dry_run=dry_run,
     )
 
-    # 连接
-    if not client.connect(login=args.login, password=args.password, server=args.server, path=args.path):
+    # 连接（自动识别参数）
+    auto_symbol = not args.no_auto_symbol  # 默认开启，除非显式禁用
+    auto_path = not args.no_auto_path
+    # --auto 强制开启
+    if args.auto:
+        auto_symbol = True
+        auto_path = True
+        logger.info("🤖 --auto 模式：启用全自动识别（路径/品种/账号）")
+
+    if not client.connect(login=args.login, password=args.password, server=args.server, path=args.path, auto_symbol=auto_symbol, auto_path=auto_path):
         logger.error("MT5 连接失败，退出")
+        if args.auto:
+            logger.info("💡 --auto 失败排查：")
+            logger.info("  1) 确认 MT5 终端已安装并登录（查看终端左上角账号）")
+            logger.info("  2) 运行 python src/mt5/run_live.py --list-terminals 查看是否能发现终端")
+            logger.info("  3) 尝试手动指定： python src/mt5/run_live.py --live --path \"C:\\Program Files\\MetaTrader 5\\terminal64.exe\"")
         return 1
+
+    # --list-symbols 调试：列出黄金品种后退出
+    if args.list_symbols:
+        try:
+            import MetaTrader5 as mt5_dbg  # type: ignore
+            all_syms = mt5_dbg.symbols_get()  # type: ignore
+            if all_syms:
+                golds = [s.name for s in all_syms if "GOLD" in s.name.upper() or "XAU" in s.name.upper()]
+                print(f"终端中黄金相关品种 ({len(golds)} 个)： {golds[:20]}")
+                print(f"当前选用: {client.symbol}")
+                # 显示详细信息
+                info = mt5_dbg.symbol_info(client.symbol)  # type: ignore
+                if info:
+                    print(f"详情: {client.symbol} 点值={info.point} 合约={info.contract_size} 可见={info.visible}")
+            else:
+                print("symbols_get 返回空，请确认终端已连接")
+        except Exception as e:
+            print(f"列出品种失败: {e}")
+        client.disconnect()
+        return 0
 
     # 获取账户与品种信息
     acc = client.get_account_info()

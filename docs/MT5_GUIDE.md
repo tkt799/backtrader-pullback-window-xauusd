@@ -101,33 +101,59 @@ Sunrise Ogle MT5 模拟 启动
 
 #### 第 4 步：连接真实 MT5（Windows）
 
+**🤖 推荐：全自动模式（零配置）**
+
 ```powershell
-# 最简（MT5 与 Python 在同一台 Windows，让 API 自动发现终端）
+# 一键自动：自动扫描本机 MT5 路径 + 自动识别黄金品种 + 复用终端已登录账号
+python src/mt5/run_live.py --auto
+
+# 调试：查看本机发现了哪些终端
+python src/mt5/run_live.py --list-terminals
+# 调试：查看黄金品种自动发现
+python src/mt5/run_live.py --auto --list-symbols
+
+# 手动指定（传统模式，多开/自定义时用）
 python src/mt5/run_live.py --live --login 12345678 --password "你的密码" --server "MetaQuotes-Demo"
 
-# 指定终端路径（多开 MT5 时必填）
+# 指定终端路径（多开 MT5 时必填，--auto 时可省略）
 python src/mt5/run_live.py --live --login 12345678 --password "xxx" --server "MetaQuotes-Demo" --path "C:\Program Files\MetaTrader 5\terminal64.exe"
 
 # 自定义风控
-python src/mt5/run_live.py --live --login ... --risk 0.01 --symbol XAUUSD --poll 10
+python src/mt5/run_live.py --auto --risk 0.01 --poll 10
 
 # 双向交易（默认仅 LONG，与回测一致；如需同时做空）
-python src/mt5/run_live.py --live --login ... --enable-short
+python src/mt5/run_live.py --auto --enable-short
+
+# 禁用某项自动（强制使用指定值）
+python src/mt5/run_live.py --auto --no-auto-symbol --symbol GOLD --no-auto-path --path "C:\MyMT5\terminal64.exe"
 ```
+
+**自动识别原理（`--auto`）**
+
+| 识别项 | 逻辑 | 回退 |
+|--------|------|------|
+| **MT5 路径** | 扫描环境变量 `MT5_PATH` → 注册表 `MetaQuotes` → 常见路径 `C:\Program Files\...` → 通配 `*\terminal64.exe` | 若失败，回退到 `mt5.initialize()` 默认（复用已运行终端） |
+| **黄金品种** | 依次尝试 `XAUUSD/GOLD/XAUUSD.a/GOLD#/...` 20+ 候选 → 再模糊搜索 `symbols_get()` 中含 `XAU/GOLD` 的品种 | 若 `--symbol` 指定品种不存在，自动切换到第一个可交易的黄金品种 |
+| **账号** | 若未提供 `--login`，直接 `mt5.initialize()` 复用终端已登录会话 | 若失败，再按显式账号尝试，多路径轮询备用 |
 
 **关键参数说明：**
 
-| 参数 | 含义 | 默认 |
-|------|------|------|
-| `--login` | MT5 账号 | 必填 |
-| `--password` | 密码 | 必填 |
-| `--server` | 服务器名 | 必填 |
-| `--path` | terminal64.exe 路径 | 自动发现 |
-| `--symbol` | 品种名（不同经纪商可能是 GOLD / XAUUSD.a / XAUUSDc） | XAUUSD |
-| `--risk` | 每笔风险百分比 | 0.01 |
-| `--poll` | 轮询秒数 | 10 |
-| `--max-daily-loss` | 日内熔断百分比 | 0.05 |
-| `--magic` | Magic Number，用于区分本策略订单 | 20250918 |
+| 参数 | 含义 | 默认 | `--auto` 时 |
+|------|------|------|-------------|
+| `--auto` | 全自动一键模式 | 关闭 | 开启后路径/品种/账号全自动 |
+| `--login` | MT5 账号 | 必填 | 可省略（复用已登录） |
+| `--password` | 密码 | 必填 | 可省略 |
+| `--server` | 服务器名 | 必填 | 可省略 |
+| `--path` | terminal64.exe 路径 | 自动发现 | 自动扫描，无需指定 |
+| `--symbol` | 品种名（不同经纪商可能是 GOLD / XAUUSD.a / XAUUSDc） | XAUUSD | 自动探测 |
+| `--risk` | 每笔风险百分比 | 0.01 | 0.01 |
+| `--poll` | 轮询秒数 | 10 | 10 |
+| `--max-daily-loss` | 日内熔断百分比 | 0.05 | 0.05 |
+| `--magic` | Magic Number，用于区分本策略订单 | 20250918 | 20250918 |
+| `--no-auto-symbol` | 禁用品种自动 | - | 用于强制锁定品种 |
+| `--no-auto-path` | 禁用路径自动 | - | 用于强制锁定路径 |
+| `--list-terminals` | 列出本机终端 | - | 调试用 |
+| `--list-symbols` | 列出黄金品种 | - | 调试用 |
 
 #### 第 5 步：实盘风控清单（必读）
 

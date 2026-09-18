@@ -20,10 +20,13 @@ from __future__ import annotations
 import time
 import math
 import logging
+import os
+import glob
+import platform
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 try:
     import MetaTrader5 as mt5  # type: ignore
@@ -40,6 +43,169 @@ except ImportError:
     PANDAS_AVAILABLE = False
 
 logger = logging.getLogger("MT5Client")
+
+# ============ 自动识别常量 ============
+# 常见黄金品种命名（不同经纪商差异很大，自动探测时依次尝试）
+GOLD_SYMBOL_CANDIDATES = [
+    "XAUUSD", "GOLD", "XAUUSD.a", "XAUUSDc", "XAUUSD.", "GOLD#",
+    "XAUUSD.r", "XAUUSDm", "XAUUSDpro", "XAU/USD", "XAUUSD-ECN",
+    "XAUUSD.s", "GOLD.m", "GOLDpro", "XAUEUR", "XAUUSD_",
+    "GOLD-ECN", "XAUUSDecn", "Gold", "XAUUSD_ecn",
+]
+
+# 常见 MT5 终端路径（Windows）
+COMMON_MT5_PATHS = [
+    r"C:\Program Files\MetaTrader 5\terminal64.exe",
+    r"C:\Program Files (x86)\MetaTrader 5\terminal64.exe",
+    r"C:\Program Files\MetaTrader 5 Terminal\terminal64.exe",
+    r"C:\MT5\terminal64.exe",
+    r"C:\Tickmill MT5\terminal64.exe",
+    r"C:\ICMarkets MT5\terminal64.exe",
+    r"C:\Exness MT5\terminal64.exe",
+    r"C:\XM MT5\terminal64.exe",
+    r"C:\Darwinex MT5\terminal64.exe",
+]
+
+
+def find_mt5_terminals() -> List[Path]:
+    """
+    自动扫描本机 MT5 终端路径，返回所有找到的 terminal64.exe
+    策略：
+    1. 环境变量 MT5_PATH / MT5_TERMINAL_PATH
+    2. Windows 注册表 (MetaQuotes)
+    3. 常见安装路径 + 通配扫描
+    4. 去重并按修改时间排序（最新的在前）
+    适合 --auto 模式，无需用户手动指定 --path
+    """
+    found: List[Path] = []
+
+    # 1. 环境变量
+    for env_key in ("MT5_PATH", "MT5_TERMINAL_PATH", "MT5_TERMINAL"):
+        env_val = os.getenv(env_key)
+        if env_val:
+            p = Path(env_val)
+            if p.is_file() and p.name.lower() == "terminal64.exe":
+                if p not in found:
+                    found.append(p)
+                    logger.debug(f"通过环境变量 {env_key} 找到: {p}")
+            elif p.is_dir():
+                cand = p / "terminal64.exe"
+                if cand.is_file() and cand not in found:
+                    found.append(cand)
+
+    # 2. Windows 注册表（仅 Windows）
+    if platform.system() == "Windows":
+        try:
+            import winreg  # type: ignore
+            reg_paths = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\MetaQuotes\MetaTrader 5"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\MetaQuotes\MetaTrader 5"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\MetaQuotes\MetaTrader 5"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\MetaQuotes\MetaTrader"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\MetaQuotes\MetaTrader"),
+            ]
+            for hive, key_path in reg_paths:
+                try:
+                    with winreg.OpenKey(hive, key_path) as key:
+                        # 遍历所有子键或值
+                        try:
+                            # 尝试读取 Path / InstallPath 等值
+                            for val_name in ("Path", "InstallPath", "Directory", ""):
+                                try:
+                                    val, _ = winreg.QueryValueEx(key, val_name)
+                                    if val:
+                                        cand = Path(str(val)) / "terminal64.exe"
+                                        if cand.is_file() and cand not in found:
+                                            found.append(cand)
+                                            logger.debug(f"通过注册表 {key_path} \\ {val_name} 找到: {cand}")
+                                except FileNotFoundError:
+                                    continue
+                        except OSError:
+                            pass
+                        # 遍历子键
+                        try:
+                            i = 0
+                            while True:
+                                sub = winreg.EnumKey(key, i)
+                                try:
+                                    with winreg.OpenKey(key, sub) as subkey:
+                                        try:
+                                            val, _ = winreg.QueryValueEx(subkey, "Path")
+                                            cand = Path(str(val)) / "terminal64.exe"
+                                            if cand.is_file() and cand not in found:
+                                                found.append(cand)
+                                        except FileNotFoundError:
+                                            pass
+                                except OSError:
+                                    pass
+                                i += 1
+                        except OSError:
+                            pass
+                except FileNotFoundError:
+                    continue
+        except ImportError:
+            logger.debug("winreg 不可用，跳过注册表扫描")
+        except Exception as e:
+            logger.debug(f"注册表扫描异常: {e}")
+
+    # 3. 常见路径直接检查
+    for p_str in COMMON_MT5_PATHS:
+        p = Path(p_str)
+        if p.is_file() and p not in found:
+            found.append(p)
+            logger.debug(f"通过常见路径找到: {p}")
+
+    # 4. 通配扫描 Program Files 下的所有 terminal64.exe（限 Windows，避免过慢）
+    if platform.system() == "Windows":
+        for base in [r"C:\Program Files", r"C:\Program Files (x86)", r"C:\MT5", r"C:\Trading"]:
+            if os.path.isdir(base):
+                try:
+                    # 限制扫描深度 2 层，避免全盘扫描
+                    pattern = os.path.join(base, "*", "terminal64.exe")
+                    for match in glob.glob(pattern):
+                        p = Path(match)
+                        if p.is_file() and p not in found:
+                            found.append(p)
+                            logger.debug(f"通过通配扫描找到: {p}")
+                    # 2层深度
+                    pattern2 = os.path.join(base, "*", "*", "terminal64.exe")
+                    for match in glob.glob(pattern2):
+                        p = Path(match)
+                        if p.is_file() and p not in found and len(found) < 10:  # 限制数量
+                            found.append(p)
+                except Exception:
+                    continue
+
+    # 去重 + 按修改时间排序（新安装的在前）
+    unique: List[Path] = []
+    seen = set()
+    for p in found:
+        rp = str(p.resolve()).lower()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(p)
+
+    # 按 mtime 排序
+    try:
+        unique.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+    except Exception:
+        pass
+
+    if unique:
+        logger.info(f"🔍 自动发现 {len(unique)} 个 MT5 终端:")
+        for idx, p in enumerate(unique, 1):
+            logger.info(f"  [{idx}] {p}")
+    else:
+        logger.debug("未自动发现任何 MT5 终端")
+
+    return unique
+
+
+def detect_gold_symbol_fallback() -> List[str]:
+    """
+    返回按优先级排序的黄金品种候选（用于离线 Dry-Run 时的提示）
+    """
+    return GOLD_SYMBOL_CANDIDATES.copy()
 
 # ============ 数据结构 ============
 @dataclass
@@ -121,6 +287,101 @@ class MT5Client:
         self._mock_balance: float = 100000.0
         self._mock_ticket_counter: int = 100000
 
+    # ---------- 自动识别 ----------
+    def auto_detect_symbol(self, preferred: Optional[str] = None) -> Optional[str]:
+        """
+        自动识别黄金品种：遍历候选列表 + 调用 MT5 的 symbols_get 模糊搜索
+        优先使用 preferred，其次按 GOLD_SYMBOL_CANDIDATES 顺序
+        成功则更新 self.symbol 并返回品种名，失败返回 None
+        """
+        if self.dry_run:
+            # Dry-Run 下不需要真实探测，直接沿用
+            return self.symbol
+
+        if not MT5_AVAILABLE or not self.connected:
+            logger.debug("未连接 MT5，无法自动识别品种")
+            return None
+
+        # 候选队列：用户指定优先，其次内置候选
+        candidates: List[str] = []
+        if preferred and preferred not in candidates:
+            candidates.append(preferred)
+        if self.symbol and self.symbol not in candidates:
+            candidates.append(self.symbol)
+        for cand in GOLD_SYMBOL_CANDIDATES:
+            if cand not in candidates:
+                candidates.append(cand)
+
+        # 1. 直接尝试候选
+        for cand in candidates:
+            info = mt5.symbol_info(cand)  # type: ignore
+            if info is not None:
+                # 有些品种存在但被禁用交易，需检查 trade_mode
+                # 优先选可见或可交易的
+                logger.info(f"🔍 品种探测命中: {cand} (可见={info.visible} 点差={info.point} 合约={info.contract_size})")
+                # 自动订阅
+                if not info.visible:
+                    try:
+                        mt5.symbol_select(cand, True)  # type: ignore
+                    except Exception:
+                        pass
+                self.symbol = cand
+                return cand
+
+        # 2. 模糊搜索：遍历所有含 GOLD/XAU 的品种
+        try:
+            all_symbols = mt5.symbols_get()  # type: ignore
+            if all_symbols:
+                gold_like = []
+                for s in all_symbols:
+                    name = s.name.upper()
+                    if "GOLD" in name or "XAU" in name:
+                        gold_like.append(s.name)
+                if gold_like:
+                    logger.info(f"🔍 模糊搜索发现 {len(gold_like)} 个黄金相关品种: {gold_like[:10]}")
+                    for cand in gold_like:
+                        # 优先 XAUUSD / GOLD 精确匹配
+                        if cand.upper() in [c.upper() for c in GOLD_SYMBOL_CANDIDATES]:
+                            info = mt5.symbol_info(cand)  # type: ignore
+                            if info is not None:
+                                if not info.visible:
+                                    mt5.symbol_select(cand, True)  # type: ignore
+                                self.symbol = cand
+                                logger.info(f"✅ 通过模糊搜索自动识别品种: {cand}")
+                                return cand
+                    # 否则返回第一个可见的
+                    for cand in gold_like:
+                        info = mt5.symbol_info(cand)  # type: ignore
+                        if info and info.visible:
+                            self.symbol = cand
+                            logger.info(f"✅ 自动选用第一个可见黄金品种: {cand}")
+                            return cand
+                    # 兜底：第一个
+                    if gold_like:
+                        cand = gold_like[0]
+                        mt5.symbol_select(cand, True)  # type: ignore
+                        self.symbol = cand
+                        return cand
+        except Exception as e:
+            logger.debug(f"模糊搜索异常: {e}")
+
+        logger.warning(f"❌ 未能自动识别任何黄金品种，候选已全部尝试: {candidates[:8]}...")
+        return None
+
+    def auto_detect_mt5_path(self) -> Optional[str]:
+        """
+        自动探测 MT5 安装路径，返回首选的 terminal64.exe
+        """
+        terminals = find_mt5_terminals()
+        if not terminals:
+            logger.warning("未自动发现 MT5 终端，请手动指定 --path")
+            return None
+        best = str(terminals[0])
+        logger.info(f"✅ 自动选用 MT5 路径: {best} (共发现 {len(terminals)} 个)")
+        if len(terminals) > 1:
+            logger.info(f"   提示：如需指定其他终端，请使用 --path \"{terminals[1]}\"")
+        return best
+
     # ---------- 连接 ----------
     def connect(
         self,
@@ -129,16 +390,27 @@ class MT5Client:
         server: Optional[str] = None,
         path: Optional[str] = None,
         timeout: int = 60000,
+        auto_symbol: bool = True,
+        auto_path: bool = True,
     ) -> bool:
         """
         连接到 MT5 终端。
         参数都可在 MT5 终端 -> 工具 -> 选项 -> 服务器 中找到。
         path: terminal64.exe 完整路径，Windows 上建议显式传入，避免多终端混淆
+        auto_symbol: True 时若指定品种不存在，自动尝试黄金候选列表
+        auto_path: True 时若 path 未指定，自动扫描本机 MT5 安装
 
+        新增自动识别能力：
+        - login/password/server 均不传时，自动复用终端已登录的账号（适合 --auto）
+        - path 为空时自动扫描注册表和常见路径
+        - 品种不存在时自动遍历 XAUUSD/GOLD 等候选
         返回 True 表示连接成功
         """
         if self.dry_run:
             logger.info("[DRY_RUN] 模拟连接成功 (无需真实MT5终端)")
+            # Dry-Run 下也演示品种探测逻辑
+            if auto_symbol and self.symbol.upper() not in [c.upper() for c in GOLD_SYMBOL_CANDIDATES]:
+                logger.info(f"[DRY_RUN] 品种 {self.symbol} 不在常规列表，仍演示自动候选: {GOLD_SYMBOL_CANDIDATES[:4]}...")
             self.connected = True
             return True
 
@@ -146,10 +418,22 @@ class MT5Client:
             logger.error("MetaTrader5 包未安装，请在 Windows 上执行: pip install MetaTrader5")
             return False
 
+        # 自动路径探测
+        original_path = path
+        if auto_path and not path:
+            detected = self.auto_detect_mt5_path()
+            if detected:
+                path = detected
+                logger.info(f"🔍 自动识别 MT5 路径: {path}")
+            else:
+                logger.info("未指定 --path 且未自动发现，将尝试默认初始化（依赖 MT5 已运行）")
+
         # 初始化终端
         init_kwargs = {}
         if path:
             init_kwargs["path"] = path
+        # 只有当用户显式提供时才传入登录参数；否则让 MT5 复用已登录会话
+        # 这样 --auto 模式下无需账号密码也能连接演示账户
         if login is not None:
             init_kwargs["login"] = login
         if password is not None:
@@ -159,19 +443,78 @@ class MT5Client:
         init_kwargs["timeout"] = timeout
         init_kwargs["portable"] = False
 
-        logger.info(f"正在连接 MT5 终端... login={login} server={server} path={path or '默认'}")
+        # 日志：区分自动 vs 手动
+        if login is None and password is None and server is None:
+            logger.info(f"正在自动连接 MT5 终端（复用已登录会话）... path={path or '默认'}")
+        else:
+            logger.info(f"正在连接 MT5 终端... login={login} server={server} path={path or '默认'}")
+
+        # 若指定路径失败，尝试回退到无 path 的默认初始化（常见于便携版）
         if not mt5.initialize(**init_kwargs):  # type: ignore
             err = mt5.last_error()  # type: ignore
-            logger.error(f"MT5 initialize 失败: {err}")
-            return False
+            logger.warning(f"MT5 initialize 失败: {err} | 参数={ {k: ('***' if k=='password' else v) for k,v in init_kwargs.items()} }")
+            # 自动回退：若最初带 path 失败，尝试不带 path 重试
+            if path and original_path is None:
+                # 说明是自动探测的路径失败，回退
+                logger.info("尝试回退：不指定 path 重新 initialize（使用已运行终端）...")
+                retry_kwargs = {k: v for k, v in init_kwargs.items() if k != "path"}
+                if not mt5.initialize(**retry_kwargs):  # type: ignore
+                    err2 = mt5.last_error()  # type: ignore
+                    logger.error(f"回退后仍失败: {err2}")
+                    # 若是多终端，尝试其他路径
+                    if auto_path:
+                        alts = find_mt5_terminals()
+                        for alt in alts[1:3]:  # 最多再试2个
+                            logger.info(f"尝试备用路径: {alt}")
+                            retry_kwargs["path"] = str(alt)
+                            if mt5.initialize(**retry_kwargs):  # type: ignore
+                                logger.info(f"✅ 备用路径连接成功: {alt}")
+                                path = str(alt)
+                                break
+                        else:
+                            return False
+                    else:
+                        return False
+                else:
+                    logger.info("✅ 回退后连接成功（复用已运行终端）")
+            else:
+                # 非自动路径，直接失败
+                # 如果是自动探测但用户显式指定 path 为空，仍有机会尝试其他候选
+                if auto_path and not original_path:
+                    alts = find_mt5_terminals()
+                    if len(alts) > 1:
+                        for alt in alts:
+                            if str(alt) == path:
+                                continue
+                            logger.info(f"尝试备用路径: {alt}")
+                            init_kwargs["path"] = str(alt)
+                            if mt5.initialize(**init_kwargs):  # type: ignore
+                                logger.info(f"✅ 备用路径连接成功: {alt}")
+                                path = str(alt)
+                                break
+                        else:
+                            logger.error("所有自动发现路径均连接失败")
+                            return False
+                    else:
+                        return False
+                else:
+                    return False
 
-        # 登录校验
+        # 登录校验（自动模式下可能已登录，无需额外校验）
         account = mt5.account_info()  # type: ignore
         if account is None:
             logger.error(f"无法获取账户信息: {mt5.last_error()}")  # type: ignore
+            # 尝试给出更友好的提示
+            terminal = mt5.terminal_info()  # type: ignore
+            if terminal is None or not terminal.connected:
+                logger.error("终端未连接经纪商服务器，请检查网络或在 MT5 中手动登录")
             return False
 
-        logger.info(f"✅ 已连接 MT5 | 账户: {account.login} | 服务器: {account.server} | 余额: {account.balance:.2f} {account.currency} | 杠杆: 1:{account.leverage}")
+        # 自动识别提示：若用户未提供登录信息，说明是复用会话
+        if login is None:
+            logger.info(f"✅ 已自动识别并复用终端已登录账户 | 账户: {account.login} | 服务器: {account.server} | 余额: {account.balance:.2f} {account.currency} | 杠杆: 1:{account.leverage}")
+        else:
+            logger.info(f"✅ 已连接 MT5 | 账户: {account.login} | 服务器: {account.server} | 余额: {account.balance:.2f} {account.currency} | 杠杆: 1:{account.leverage}")
 
         # 检查交易权限
         terminal = mt5.terminal_info()  # type: ignore
@@ -180,24 +523,67 @@ class MT5Client:
             if not terminal.trade_allowed:
                 logger.warning("⚠️  终端未允许自动交易！请在 MT5 中点击 'Algo Trading' 按钮使其变绿，并在 工具->选项->EA交易 中勾选 '允许自动交易'")
 
-        # 检查品种可用性
+        # 检查品种可用性（带自动回退）
+        original_symbol = self.symbol
         symbol_info = mt5.symbol_info(self.symbol)  # type: ignore
         if symbol_info is None:
-            logger.error(f"品种 {self.symbol} 不存在，请检查是否拼写为 XAUUSD / GOLD 等 (不同经纪商命名不同)")
-            return False
+            logger.warning(f"品种 {self.symbol} 不存在，尝试自动识别黄金品种...")
+            if auto_symbol:
+                detected = self.auto_detect_symbol(preferred=original_symbol)
+                if detected:
+                    symbol_info = mt5.symbol_info(detected)  # type: ignore
+                    logger.info(f"✅ 自动识别品种成功: {original_symbol} → {detected}")
+                else:
+                    logger.error(f"品种 {original_symbol} 不存在，且自动识别失败。请检查是否拼写为 XAUUSD / GOLD 等 (不同经纪商命名不同)，或用 --symbol 指定")
+                    # 打印可用黄金品种供用户参考
+                    try:
+                        all_syms = mt5.symbols_get()  # type: ignore
+                        if all_syms:
+                            golds = [s.name for s in all_syms if "GOLD" in s.name.upper() or "XAU" in s.name.upper()][:10]
+                            if golds:
+                                logger.info(f"终端中可用的黄金相关品种: {golds}")
+                    except Exception:
+                        pass
+                    return False
+            else:
+                logger.error(f"品种 {self.symbol} 不存在，请检查是否拼写为 XAUUSD / GOLD 等 (不同经纪商命名不同)")
+                return False
+        else:
+            # 即使品种存在，也尝试确认是否可见；若不可见，标记为需订阅
+            logger.debug(f"品种 {self.symbol} 存在: 可见={symbol_info.visible}")
 
         # 选中品种到市场报价
         if not symbol_info.visible:
             logger.info(f"正在订阅品种 {self.symbol}...")
             if not mt5.symbol_select(self.symbol, True):  # type: ignore
                 logger.error(f"订阅 {self.symbol} 失败")
-                return False
+                # 尝试自动识别备用品种
+                if auto_symbol and self.symbol == original_symbol:
+                    logger.info("订阅失败，尝试自动切换到其他黄金品种...")
+                    alt = self.auto_detect_symbol()
+                    if alt and alt != original_symbol:
+                        symbol_info = mt5.symbol_info(alt)  # type: ignore
+                        if symbol_info:
+                            logger.info(f"✅ 已切换到备用品种: {alt}")
+                        else:
+                            return False
+                    else:
+                        return False
+                else:
+                    return False
 
         self.connected = True
+        # 记录最终使用的路径和品种，供外部查询
+        self._connected_path = path
+        self._connected_symbol = self.symbol
         logger.info(f"✅ 品种 {self.symbol} 已就绪 | 点差: {symbol_info.point} | 合约大小: {symbol_info.contract_size}")
 
         # 打印关键配置
         logger.info(f"时间周期: M{self.timeframe_minutes} | Magic: {self.magic} | 允许偏差: {self.deviation} points")
+        if auto_symbol and original_symbol != self.symbol:
+            logger.info(f"🔍 品种自动识别生效: 输入 {original_symbol} → 实际使用 {self.symbol}")
+        if auto_path and original_path != path:
+            logger.info(f"🔍 路径自动识别生效: {path}")
 
         return True
 
